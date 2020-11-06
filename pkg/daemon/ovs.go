@@ -2,6 +2,11 @@ package daemon
 
 import (
 	"fmt"
+	"net"
+	"os/exec"
+	"strings"
+	"time"
+
 	"github.com/Mellanox/sriovnet"
 	kubeovnv1 "github.com/alauda/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/alauda/kube-ovn/pkg/ovs"
@@ -11,10 +16,6 @@ import (
 	goping "github.com/oilbeater/go-ping"
 	"github.com/vishvananda/netlink"
 	"k8s.io/klog"
-	"net"
-	"os/exec"
-	"strings"
-	"time"
 )
 
 func (csh cniServerHandler) configureNic(podName, podNamespace, netns, containerID, mac, ip, gateway, ingress, egress, vlanID, DeviceID string) error {
@@ -34,6 +35,16 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, netns, container
 		}
 	}
 
+	// ipStr1 is used for test. How to adapt dualstack for ovs config
+	var ipStr, ipStr1 string
+	if util.CheckProtocol(gateway) == kubeovnv1.ProtocolDual {
+		ips := strings.Split(ip, ",")
+		ipStr1 = strings.Split(ips[0], "/")[0] + "," + strings.Split(ips[1], "/")[0]
+		ipStr = strings.Split(ips[0], "/")[0]
+	} else {
+		ipStr = strings.Split(ip, "/")[0]
+	}
+
 	ifaceID := fmt.Sprintf("%s.%s", podName, podNamespace)
 	ovs.CleanDuplicatePort(ifaceID)
 	// Add veth pair host end to ovs port
@@ -41,7 +52,7 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, netns, container
 		"set", "interface", hostNicName, fmt.Sprintf("external_ids:iface-id=%s", ifaceID),
 		fmt.Sprintf("external_ids:pod_name=%s", podName),
 		fmt.Sprintf("external_ids:pod_namespace=%s", podNamespace),
-		fmt.Sprintf("external_ids:ip=%s", strings.Split(ip, "/")[0]))
+		fmt.Sprintf("external_ids:ip=%s", ipStr))
 	if err != nil {
 		return fmt.Errorf("add nic to ovs failed %v: %q", err, output)
 	}
@@ -140,7 +151,7 @@ func configureContainerNic(nicName, ipAddr, gateway string, macAddr net.Hardware
 		if err = netlink.LinkSetName(containerLink, "eth0"); err != nil {
 			return err
 		}
-		if util.CheckProtocol(ipAddr) == kubeovnv1.ProtocolIPv6 {
+		if util.CheckProtocol(ipAddr) == kubeovnv1.ProtocolDual || util.CheckProtocol(ipAddr) == kubeovnv1.ProtocolIPv6 {
 			// For docker version >=17.x the "none" network will disable ipv6 by default.
 			// We have to enable ipv6 here to add v6 address and gateway.
 			// See https://github.com/containernetworking/cni/issues/531
@@ -176,6 +187,26 @@ func configureContainerNic(nicName, ipAddr, gateway string, macAddr net.Hardware
 				Dst:       defaultNet,
 				Gw:        net.ParseIP(gateway),
 			})
+		case kubeovnv1.ProtocolDual:
+			gws := strings.Split(gateway, ",")
+			_, defaultNet, _ := net.ParseCIDR("0.0.0.0/0")
+			err = netlink.RouteAdd(&netlink.Route{
+				LinkIndex: containerLink.Attrs().Index,
+				Scope:     netlink.SCOPE_UNIVERSE,
+				Dst:       defaultNet,
+				Gw:        net.ParseIP(gws[0]),
+			})
+			if err != nil {
+				return fmt.Errorf("config gateway failed %v", err)
+			}
+
+			_, defaultNet, _ = net.ParseCIDR("::/0")
+			err = netlink.RouteAdd(&netlink.Route{
+				LinkIndex: containerLink.Attrs().Index,
+				Scope:     netlink.SCOPE_UNIVERSE,
+				Dst:       defaultNet,
+				Gw:        net.ParseIP(gws[1]),
+			})
 		}
 
 		if err != nil {
@@ -187,7 +218,15 @@ func configureContainerNic(nicName, ipAddr, gateway string, macAddr net.Hardware
 }
 
 func waiteNetworkReady(gateway string) error {
-	pinger, err := goping.NewPinger(gateway)
+	var gw string
+	if util.CheckProtocol(gateway) == kubeovnv1.ProtocolDual {
+		// Just test ipv4 ping in dualstack
+		gw = strings.Split(gateway, ",")[0]
+	} else {
+		gw = gateway
+	}
+
+	pinger, err := goping.NewPinger(gw)
 	if err != nil {
 		return fmt.Errorf("failed to init pinger, %v", err)
 	}
@@ -293,13 +332,16 @@ func configureNic(link, ip string, macAddr net.HardwareAddr, mtu int) error {
 		return fmt.Errorf("can not find nic %s %v", link, err)
 	}
 
-	ipAddr, err := netlink.ParseAddr(ip)
-	if err != nil {
-		return fmt.Errorf("can not parse %s %v", ip, err)
-	}
+	ips := strings.Split(ip, ",")
+	for _, ipStr := range ips {
+		ipAddr, err := netlink.ParseAddr(ipStr)
+		if err != nil {
+			return fmt.Errorf("can not parse %s %v", ip, err)
+		}
 
-	if err = netlink.AddrReplace(nodeLink, ipAddr); err != nil {
-		return fmt.Errorf("can not add address to nic %s, %v", link, err)
+		if err = netlink.AddrReplace(nodeLink, ipAddr); err != nil {
+			return fmt.Errorf("can not add address to nic %s, %v", link, err)
+		}
 	}
 
 	if err = netlink.LinkSetHardwareAddr(nodeLink, macAddr); err != nil {
